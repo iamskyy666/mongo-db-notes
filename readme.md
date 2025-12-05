@@ -1500,3 +1500,888 @@ Follows ESR rule:
 
 ---
 
+Let’s build a solid mental model and a working blueprint for using **MongoDB as the database with Golang + Gin**. We’ll cover architecture, best practices, code you can copy, production concerns (pooling, timeouts, TLS), transactions, testing tips, and a recommended project layout.
+
+Below are a few authoritative references we leaned on while preparing this: the official MongoDB Go driver docs (connect & tutorials), the official tutorial that pairs Gin + Go driver, connection-pool guidance, and transaction docs. ([mongodb.com][1])
+
+---
+
+# 1) High-level design & responsibilities
+
+* **Single global Mongo client**: create one `*mongo.Client` per process and reuse it. The client manages connection pools under the hood. Creating a new client per request is expensive and will exhaust connections. ([mongodb.com][1])
+* **Context per operation**: use `context.Context` with reasonable timeouts for each DB call; never reuse a cancelled context. Timeouts protect your app and avoid leaked goroutines. ([Go Packages][2])
+* **Dependency injection into handlers**: inject the DB (or collections) into Gin handlers via middleware or an application struct.
+* **Graceful shutdown**: disconnect the client on shutdown to allow the driver to close pools cleanly. ([mongodb.com][1])
+
+---
+
+# 2) Dependencies & install
+
+```bash
+go get go.mongodb.org/mongo-driver/mongo
+go get github.com/gin-gonic/gin
+```
+
+(Driver docs & examples use `go.mongodb.org/mongo-driver`.) ([GitHub][3])
+
+---
+
+# 3) Boilerplate: connect, ping, graceful shutdown
+
+```go
+package db
+
+import (
+    "context"
+    "time"
+    "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/mongo/options"
+    "log"
+)
+
+func Connect(ctx context.Context, uri string) (*mongo.Client, error) {
+    // ctx should have timeout (e.g., 10-20s) when calling Connect
+    clientOpts := options.Client().ApplyURI(uri)
+    // configure pool if needed:
+    // clientOpts.SetMaxPoolSize(100)
+    client, err := mongo.Connect(ctx, clientOpts)
+    if err != nil {
+        return nil, err
+    }
+    // Ping to verify connection
+    pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+    if err := client.Ping(pingCtx, nil); err != nil {
+        return nil, err
+    }
+    return client, nil
+}
+
+func Disconnect(ctx context.Context, client *mongo.Client) error {
+    return client.Disconnect(ctx)
+}
+```
+
+**Notes**: pass an explicit timeout on the `Connect` call (we usually use 10–20s). Ping verifies connectivity. ([Go Packages][2])
+
+---
+
+# 4) Wire Mongo into Gin (middleware / app struct)
+
+Approach A — *application struct* (explicit DI):
+
+```go
+type App struct {
+    Router *gin.Engine
+    DB     *mongo.Database
+}
+
+func NewApp(db *mongo.Database) *App {
+    r := gin.Default()
+    a := &App{Router: r, DB: db}
+    // register handlers with closures capturing a.DB
+    r.GET("/users/:id", a.getUser)
+    return a
+}
+```
+
+Approach B — *Gin middleware* that attaches DB or collections to `*gin.Context`:
+
+```go
+func DBMiddleware(db *mongo.Database) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        c.Set("db", db) // or set specific collection
+        c.Next()
+    }
+}
+```
+
+Then in handler:
+
+```go
+db := c.MustGet("db").(*mongo.Database)
+users := db.Collection("users")
+```
+
+We prefer the app-struct pattern for type-safety and ease of testing, but middleware is quick for small apps.
+
+---
+
+# 5) Models, BSON tags, and validation
+
+Define models with BSON tags for Mongo encoding/decoding:
+
+```go
+type User struct {
+    ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+    Name      string             `bson:"name" json:"name" binding:"required"`
+    Email     string             `bson:"email" json:"email" binding:"required,email"`
+    CreatedAt time.Time          `bson:"createdAt" json:"createdAt"`
+}
+```
+
+* Use `primitive.ObjectID` for `_id`.
+* Use Gin’s `binding` tags for request validation, and keep BSON/JSON tags in sync where possible.
+
+---
+
+# 6) Common CRUD examples (concise, idiomatic)
+
+Insert document:
+
+```go
+func createUser(ctx context.Context, coll *mongo.Collection, u *User) (*mongo.InsertOneResult, error) {
+    u.CreatedAt = time.Now().UTC()
+    return coll.InsertOne(ctx, u)
+}
+```
+
+Find one by id:
+
+```go
+func getUserByID(ctx context.Context, coll *mongo.Collection, idStr string) (*User, error) {
+    id, err := primitive.ObjectIDFromHex(idStr)
+    if err != nil { return nil, err }
+    var u User
+    err = coll.FindOne(ctx, bson.M{"_id": id}).Decode(&u)
+    if err == mongo.ErrNoDocuments { return nil, nil }
+    return &u, err
+}
+```
+
+Find many (cursor):
+
+```go
+cur, err := coll.Find(ctx, bson.M{"active": true})
+defer cur.Close(ctx)
+for cur.Next(ctx) {
+    var u User
+    if err := cur.Decode(&u); err != nil { ... }
+}
+```
+
+Update:
+
+```go
+res, err := coll.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"name": "New"}})
+```
+
+Delete:
+
+```go
+res, err := coll.DeleteOne(ctx, bson.M{"_id": id})
+```
+
+**Remember**: always pass a context with timeout for each operation.
+
+---
+
+# 7) Indexes & performance
+
+* Create indexes for fields used in filters/sorts (e.g., `email` unique index). Creating indexes at app startup is common for small apps, or via migrations for larger apps.
+* Use `coll.Indexes().CreateOne(ctx, mongo.IndexModel{ Keys: bson.D{{"email", 1}}, Options: options.Index().SetUnique(true) })`.
+* Tune `maxPoolSize`, `minPoolSize` when you have predictable concurrency/throughput needs; the driver manages pools internally but we can override defaults. ([mongodb.com][4])
+
+---
+
+# 8) Transactions (multi-document / multi-collection)
+
+* Transactions require a **replica set** or **sharded cluster**; single-node standalone does not support them. Use transactions only when atomicity across multiple documents/collections is required. ([mongodb.com][5])
+
+Example:
+
+```go
+session, err := client.StartSession()
+if err != nil { ... }
+defer session.EndSession(ctx)
+
+callback := func(sessCtx mongo.SessionContext) (interface{}, error) {
+    if _, err := collA.InsertOne(sessCtx, docA); err != nil { return nil, err }
+    if _, err := collB.UpdateOne(sessCtx, filterB, updateB); err != nil { return nil, err }
+    return nil, nil
+}
+
+_, err = session.WithTransaction(ctx, callback)
+```
+
+The driver takes care of retries for transient errors if you use `WithTransaction`. Test transaction flows carefully. ([mongodb.com][5])
+
+---
+
+# 9) Connection pool & timeouts (production concerns)
+
+* **Pool**: defaults are reasonable; adjust `MaxPoolSize` when connection limits or concurrency demand it. Monitor pool wait times to detect undersizing. ([mongodb.com][6])
+* **Socket / operation timeouts**: set operation-level timeouts (via contexts). Avoid very short timeouts for large queries.
+* **Network resilience**: implement retry logic for transient network errors; the Go driver automatically handles some retries (e.g., `WithTransaction`), but explicit retries for idempotent ops may be required.
+* **DNS SRV with Atlas**: if using Atlas, use the SRV URI (starting `mongodb+srv://`) and enable TLS.
+
+---
+
+# 10) Security & deployment tips
+
+* Use **environment variables** (or secret manager) for credentials/URIs.
+* Use TLS; Atlas enforces TLS by default.
+* Limit DB user permissions — prefer least privilege.
+* For production on Kubernetes / containers: mount CA certs if needed, set connection limits based on pod replicas and DB max connections. Monitor metrics (MongoSI/Atlas metrics). ([mongodb.com][1])
+
+---
+
+# 11) Testing strategies
+
+* **Integration tests**: use a real MongoDB instance spun up in CI — options: MongoDB Atlas ephemeral projects, Testcontainers (docker) for local/CI, or a dedicated test cluster.
+* **Unit tests**: abstract DB access behind interfaces so we can use fake implementations in unit tests. Example:
+
+```go
+type UserStore interface {
+    Insert(ctx context.Context, u *User) error
+    FindByID(ctx context.Context, id string) (*User, error)
+}
+```
+
+* The official driver does not provide an in-memory replacement, so use DI + fakes or testcontainers. (This keeps tests deterministic and fast.) ([DigitalOcean][7])
+
+---
+
+# 12) Example project layout (recommended)
+
+```
+/cmd/app/main.go
+/internal/app/app.go          // wire router and services
+/internal/db/mongo.go         // connect/disconnect, client wrapper
+/internal/models/user.go
+/internal/store/user_store.go // interacts with mongo.Collection
+/internal/handlers/user.go
+/internal/migrations/*        // index creation, migrations
+/pkg/config/config.go         // env loader
+```
+
+Pros: clear separation of concerns, easy to mock `store` layer in tests.
+
+---
+
+# 13) Graceful shutdown example (Gin + Mongo)
+
+```go
+srv := &http.Server{
+    Addr:    ":8080",
+    Handler: router,
+}
+
+go func(){ srv.ListenAndServe() }()
+
+quit := make(chan os.Signal)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+<-quit
+
+ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer cancel()
+srv.Shutdown(ctx)
+db.Disconnect(ctx) // mongo client disconnect
+```
+
+Always call `client.Disconnect(ctx)` so the driver closes connections/pools cleanly. ([mongodb.com][1])
+
+---
+
+# 14) Common pitfalls & debug tips
+
+* **Reusing cancelled contexts** causes `context canceled` errors. Create a fresh context per operation. ([mongodb.com][8])
+* **Creating many clients** (one per request) exhausts connections — use singleton client. ([mongodb.com][1])
+* **Forgetting indexes** leads to slow queries at scale — create index migrations early. ([mongodb.com][4])
+
+---
+
+# 15) Minimal end-to-end example (summary)
+
+1. `Connect()` on app startup with timeout and `Ping`. ([mongodb.com][1])
+2. Build an `App` struct with `*mongo.Database` and attach Gin routes.
+3. For each request, create `ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)` and defer `cancel()`. Use that ctx for DB calls.
+4. Use `coll.FindOne(ctx, filter).Decode(&result)` patterns.
+5. Indexes and pool tuning as app scales. ([mongodb.com][6])
+
+---
+
+Now, let’s add **JWT auth** to our Go + Gin + MongoDB app. Below we’ll build a secure, production-minded flow with:
+
+* signup (hash passwords with bcrypt)
+* login (issue access + refresh tokens)
+* refresh token endpoint (rotate + persist refresh tokens)
+* middleware that protects routes by validating access tokens
+* logout (revoke refresh token)
+* secure configuration and deployment notes
+
+We'll use a hybrid approach: **stateless access tokens** (short-lived JWTs) + **stateful refresh tokens** stored in MongoDB so we can revoke/rotate them. This gives good UX and enables session invalidation.
+
+---
+
+# 1) Dependencies
+
+```bash
+go get github.com/gin-gonic/gin
+go get go.mongodb.org/mongo-driver/mongo
+go get github.com/golang-jwt/jwt/v5
+go get golang.org/x/crypto/bcrypt
+```
+
+(We use `github.com/golang-jwt/jwt/v5` for JWT handling, `bcrypt` for password hashing.)
+
+---
+
+# 2) Environment / config
+
+Put secrets and expiries into environment variables (or secret manager):
+
+```
+JWT_ACCESS_SECRET=super-secret-access-key
+JWT_REFRESH_SECRET=super-secret-refresh-key
+JWT_ACCESS_EXPIRE_MINUTES=15
+JWT_REFRESH_EXPIRE_DAYS=7
+```
+
+We’ll read them in a `config` struct in code.
+
+---
+
+# 3) Models
+
+```go
+// models/user.go
+package models
+
+import (
+    "time"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+type User struct {
+    ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+    Email     string             `bson:"email" json:"email"`
+    Password  string             `bson:"password,omitempty" json:"-"`
+    Name      string             `bson:"name" json:"name"`
+    CreatedAt time.Time          `bson:"createdAt" json:"createdAt"`
+}
+
+// models/token.go
+package models
+
+import (
+    "time"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+type RefreshTokenRecord struct {
+    ID           primitive.ObjectID `bson:"_id,omitempty"`
+    Token        string             `bson:"token"`
+    UserID       primitive.ObjectID `bson:"userId"`
+    ExpiresAt    time.Time          `bson:"expiresAt"`
+    CreatedAt    time.Time          `bson:"createdAt"`
+    Revoked      bool               `bson:"revoked"`
+    ReplacedBy   string             `bson:"replacedBy,omitempty"`
+}
+```
+
+---
+
+# 4) Auth helpers — hashing + verifying passwords
+
+```go
+package auth
+
+import "golang.org/x/crypto/bcrypt"
+
+func HashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    return string(bytes), err
+}
+
+func CheckPasswordHash(password, hash string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+    return err == nil
+}
+```
+
+---
+
+# 5) JWT generation & validation
+
+We define claims and functions for signing/validating access and refresh tokens.
+
+```go
+package auth
+
+import (
+    "time"
+    "errors"
+
+    jwt "github.com/golang-jwt/jwt/v5"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+type JWTManager struct {
+    AccessSecret  []byte
+    RefreshSecret []byte
+    AccessTTL     time.Duration
+    RefreshTTL    time.Duration
+}
+
+type AccessClaims struct {
+    UserID string `json:"uid"`
+    jwt.RegisteredClaims
+}
+
+type RefreshClaims struct {
+    UserID string `json:"uid"`
+    jwt.RegisteredClaims
+}
+
+func NewJWTManager(accessSecret, refreshSecret string, accessTTL, refreshTTL time.Duration) *JWTManager {
+    return &JWTManager{
+        AccessSecret:  []byte(accessSecret),
+        RefreshSecret: []byte(refreshSecret),
+        AccessTTL:     accessTTL,
+        RefreshTTL:    refreshTTL,
+    }
+}
+
+func (m *JWTManager) GenerateAccessToken(userID primitive.ObjectID) (string, time.Time, error) {
+    expiresAt := time.Now().Add(m.AccessTTL)
+    claims := AccessClaims{
+        UserID: userID.Hex(),
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(expiresAt),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+            Subject:   userID.Hex(),
+        },
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, err := token.SignedString(m.AccessSecret)
+    return signed, expiresAt, err
+}
+
+func (m *JWTManager) GenerateRefreshToken(userID primitive.ObjectID) (string, time.Time, error) {
+    expiresAt := time.Now().Add(m.RefreshTTL)
+    claims := RefreshClaims{
+        UserID: userID.Hex(),
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(expiresAt),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+            Subject:   userID.Hex(),
+            ID:        primitive.NewObjectID().Hex(), // unique id for rotation tracking
+        },
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, err := token.SignedString(m.RefreshSecret)
+    return signed, expiresAt, err
+}
+
+func (m *JWTManager) VerifyAccessToken(tokenStr string) (*AccessClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenStr, &AccessClaims{}, func(t *jwt.Token) (interface{}, error) {
+        if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, errors.New("invalid signing method")
+        }
+        return m.AccessSecret, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    claims, ok := token.Claims.(*AccessClaims)
+    if !ok || !token.Valid {
+        return nil, errors.New("invalid token claims")
+    }
+    return claims, nil
+}
+
+func (m *JWTManager) VerifyRefreshToken(tokenStr string) (*RefreshClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenStr, &RefreshClaims{}, func(t *jwt.Token) (interface{}, error) {
+        if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, errors.New("invalid signing method")
+        }
+        return m.RefreshSecret, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    claims, ok := token.Claims.(*RefreshClaims)
+    if !ok || !token.Valid {
+        return nil, errors.New("invalid token claims")
+    }
+    return claims, nil
+}
+```
+
+---
+
+# 6) Persistence for refresh tokens (Mongo)
+
+We store refresh tokens so we can revoke or rotate them.
+
+```go
+package store
+
+import (
+    "context"
+    "time"
+    "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/bson"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+    "myapp/models"
+)
+
+type TokenStore struct {
+    col *mongo.Collection
+}
+
+func NewTokenStore(db *mongo.Database, collName string) *TokenStore {
+    return &TokenStore{col: db.Collection(collName)}
+}
+
+func (s *TokenStore) SaveRefreshToken(ctx context.Context, token string, userID primitive.ObjectID, expiresAt time.Time) error {
+    rec := models.RefreshTokenRecord{
+        Token:     token,
+        UserID:    userID,
+        ExpiresAt: expiresAt,
+        CreatedAt: time.Now(),
+        Revoked:   false,
+    }
+    _, err := s.col.InsertOne(ctx, rec)
+    return err
+}
+
+func (s *TokenStore) RevokeRefreshToken(ctx context.Context, token string) error {
+    _, err := s.col.UpdateOne(ctx, bson.M{"token": token}, bson.M{"$set": bson.M{"revoked": true}})
+    return err
+}
+
+func (s *TokenStore) FindValidToken(ctx context.Context, token string) (*models.RefreshTokenRecord, error) {
+    var rec models.RefreshTokenRecord
+    err := s.col.FindOne(ctx, bson.M{"token": token, "revoked": false}).Decode(&rec)
+    if err != nil {
+        return nil, err
+    }
+    if rec.ExpiresAt.Before(time.Now()) {
+        return nil, mongo.ErrNoDocuments
+    }
+    return &rec, nil
+}
+```
+
+We should create TTL indexes on `expiresAt` and maybe an index on `token` for fast lookup:
+
+```go
+s.col.Indexes().CreateOne(ctx, mongo.IndexModel{
+    Keys: bson.D{{"expiresAt", 1}},
+    Options: options.Index().SetExpireAfterSeconds(0),
+})
+```
+
+---
+
+# 7) Handlers: Register, Login, Refresh, Logout
+
+Assume `userStore` implements user creation & lookup. We'll sketch handlers.
+
+```go
+// handlers/auth.go
+package handlers
+
+import (
+    "context"
+    "net/http"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+
+    "myapp/auth"   // JWTManager + helpers
+    "myapp/store"  // TokenStore, UserStore
+    "myapp/models"
+)
+
+type AuthHandler struct {
+    JWT    *auth.JWTManager
+    Users  *store.UserStore
+    Tokens *store.TokenStore
+}
+
+type registerReq struct {
+    Name     string `json:"name" binding:"required"`
+    Email    string `json:"email" binding:"required,email"`
+    Password string `json:"password" binding:"required,min=8"`
+}
+
+func (h *AuthHandler) Register(c *gin.Context) {
+    var req registerReq
+    if err := c.BindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+    defer cancel()
+    // check existing
+    if exists, _ := h.Users.ExistsByEmail(ctx, req.Email); exists {
+        c.JSON(http.StatusConflict, gin.H{"error": "email already in use"})
+        return
+    }
+    hashed, err := auth.HashPassword(req.Password)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+        return
+    }
+    user := &models.User{
+        Email:     req.Email,
+        Password:  hashed,
+        Name:      req.Name,
+        CreatedAt: time.Now(),
+    }
+    newID, err := h.Users.Create(ctx, user)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
+        return
+    }
+    c.JSON(http.StatusCreated, gin.H{"id": newID.Hex()})
+}
+
+type loginReq struct {
+    Email    string `json:"email" binding:"required,email"`
+    Password string `json:"password" binding:"required"`
+}
+
+func (h *AuthHandler) Login(c *gin.Context) {
+    var req loginReq
+    if err := c.BindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+    defer cancel()
+    user, err := h.Users.FindByEmail(ctx, req.Email)
+    if err != nil || user == nil {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+        return
+    }
+    if !auth.CheckPasswordHash(req.Password, user.Password) {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+        return
+    }
+    uid := user.ID
+    accessTok, accessExp, err := h.JWT.GenerateAccessToken(uid)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "couldn't create access token"})
+        return
+    }
+    refreshTok, refreshExp, err := h.JWT.GenerateRefreshToken(uid)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "couldn't create refresh token"})
+        return
+    }
+    // persist refresh token
+    if err := h.Tokens.SaveRefreshToken(ctx, refreshTok, uid, refreshExp); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store token"})
+        return
+    }
+    // return tokens; recommended: put refresh token in httpOnly secure cookie
+    c.JSON(http.StatusOK, gin.H{
+        "access_token": accessTok,
+        "expires_at": accessExp.UTC().Format(time.RFC3339),
+        "refresh_token": refreshTok, // opt: omit if using cookie
+    })
+}
+
+type refreshReq struct {
+    RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+func (h *AuthHandler) Refresh(c *gin.Context) {
+    var req refreshReq
+    if err := c.BindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+    defer cancel()
+    claims, err := h.JWT.VerifyRefreshToken(req.RefreshToken)
+    if err != nil {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
+        return
+    }
+    // verify token exists & not revoked
+    rec, err := h.Tokens.FindValidToken(ctx, req.RefreshToken)
+    if err != nil {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh token not found or expired"})
+        return
+    }
+    // rotate: revoke old token and issue new refresh token
+    if err := h.Tokens.RevokeRefreshToken(ctx, req.RefreshToken); err != nil {
+        // log error but continue maybe
+    }
+    uid, _ := primitive.ObjectIDFromHex(claims.UserID)
+    newRefresh, newRefreshExp, err := h.JWT.GenerateRefreshToken(uid)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate refresh token"})
+        return
+    }
+    if err := h.Tokens.SaveRefreshToken(ctx, newRefresh, uid, newRefreshExp); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save refresh token"})
+        return
+    }
+    // issue new access token
+    accessTok, accessExp, err := h.JWT.GenerateAccessToken(uid)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate access token"})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "access_token": accessTok,
+        "expires_at": accessExp.UTC().Format(time.RFC3339),
+        "refresh_token": newRefresh,
+    })
+}
+
+type logoutReq struct {
+    RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+func (h *AuthHandler) Logout(c *gin.Context) {
+    var req logoutReq
+    if err := c.BindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+    defer cancel()
+    if err := h.Tokens.RevokeRefreshToken(ctx, req.RefreshToken); err != nil {
+        // ignore or return error
+    }
+    c.Status(http.StatusNoContent)
+}
+```
+
+Notes:
+
+* Prefer to return refresh token in an **HttpOnly Secure cookie** instead of JSON to reduce XSS risk. If we do cookies, we must set `SameSite` appropriately and use HTTPS.
+* Rotate refresh tokens: revoke old and store new token; store `replacedBy` if you want to trace.
+
+---
+
+# 8) Middleware for protecting endpoints (access token)
+
+```go
+package middleware
+
+import (
+    "net/http"
+    "strings"
+
+    "github.com/gin-gonic/gin"
+    "myapp/auth"
+)
+
+func AuthRequired(jwtManager *auth.JWTManager) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        authHeader := c.GetHeader("Authorization")
+        if authHeader == "" {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authorization header required"})
+            return
+        }
+        parts := strings.SplitN(authHeader, " ", 2)
+        if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authorization header format must be Bearer {token}"})
+            return
+        }
+        token := parts[1]
+        claims, err := jwtManager.VerifyAccessToken(token)
+        if err != nil {
+            c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+            return
+        }
+        c.Set("userID", claims.UserID)
+        c.Next()
+    }
+}
+```
+
+In handlers we can get user id:
+
+```go
+uidStr, _ := c.Get("userID")
+```
+
+---
+
+# 9) Wiring it together in `main.go`
+
+```go
+func main() {
+    // load env
+    accessSecret := os.Getenv("JWT_ACCESS_SECRET")
+    refreshSecret := os.Getenv("JWT_REFRESH_SECRET")
+    accessTTL := time.Minute * 15
+    refreshTTL := time.Hour * 24 * 7
+
+    jwtManager := auth.NewJWTManager(accessSecret, refreshSecret, accessTTL, refreshTTL)
+
+    client := // connect to mongo
+    db := client.Database("yourdb")
+    userStore := store.NewUserStore(db, "users")
+    tokenStore := store.NewTokenStore(db, "refresh_tokens")
+
+    authHandler := handlers.AuthHandler{
+        JWT: jwtManager,
+        Users: userStore,
+        Tokens: tokenStore,
+    }
+
+    r := gin.Default()
+    api := r.Group("/api")
+    api.POST("/register", authHandler.Register)
+    api.POST("/login", authHandler.Login)
+    api.POST("/refresh", authHandler.Refresh)
+    api.POST("/logout", authHandler.Logout)
+
+    // protected
+    protected := api.Group("/me")
+    protected.Use(middleware.AuthRequired(jwtManager))
+    protected.GET("/", func(c *gin.Context) {
+        uid, _ := c.Get("userID")
+        c.JSON(200, gin.H{"user_id": uid})
+    })
+
+    r.Run(":8080")
+}
+```
+
+---
+
+# 10) Security best practices (must-follow)
+
+* **Use HTTPS** always. Never send tokens over plain HTTP.
+* **HttpOnly & Secure cookies** for refresh tokens reduce XSS risk. If we do cookies, protect against CSRF (use double submit cookie or SameSite=strict/lax depending on UX).
+* **Rotate secrets & support secret rotation**: keep short access secret lifetime, rotate refresh secret carefully (maintain old secret for a short overlap if needed).
+* **Least privilege DB user**: limit Mongo user to only required collections and actions.
+* **Short-lived access tokens** (e.g., 5–30 minutes).
+* **Store refresh tokens server-side** if we need to be able to revoke sessions (logout, password change).
+* **Monitor** suspicious token usage (multiple refresh token uses from different IPs — possible token theft). Consider storing `ip`, `userAgent` in `RefreshTokenRecord`.
+* **Limit concurrent sessions** if business requires — e.g., restrict number of active refresh tokens per user.
+* **Hash refresh tokens in DB** (optional): to avoid DB compromise exposing raw refresh tokens, store a hashed version (like bcrypt or HMAC) and compare hash of presented token. That prevents attackers with DB read-only access from using tokens.
+
+---
+
+# 11) Testing tips
+
+* Unit test token generation/verification with known secrets and simulated time (use `jwt.WithLeeway` or set `IssuedAt` / `ExpiresAt` manually).
+* Integration test login/refresh flows with a real Mongo instance (testcontainers or local mongo in CI).
+* Test security edge-cases: reuse of revoked refresh token should be rejected. Test refresh token rotation.
+
+---
+
+# 12) Optional improvements
+
+* **Stateless refresh tokens** — we can sign refresh tokens but still keep a revocation list in DB for logout.
+* **Use asymmetric keys (RS256)** — allows key rotation and separation of signing vs verification if we have multiple services. Keep private key safe.
+* **Use OAuth2/JWT libraries** (if we need more features): consider full OAuth2 for third-party auth.
+* **Rate-limit login endpoint** (prevent credential stuffing).
+
+---
+
+
+
